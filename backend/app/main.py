@@ -76,49 +76,59 @@ class ConsumeIn(BaseModel):
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
     c = connect()
-    # 资格与分装母批一致：on_shelf + qty_remain>0 + clean
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0 "
-        "AND data_quality='clean' AND split_from IS NULL",
-        (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        # 守卫式扣减：拆批/过期可能在计划与落库之间改变行；余量不够则整单回滚，
-        # 绝不把扣减落到已不足量（例如拆后余量变小）的旧母批上。
-        cur = c.execute(
-            "UPDATE lots SET qty_remain = qty_remain - ? "
-            "WHERE id=? AND status='on_shelf' AND data_quality='clean' AND qty_remain >= ?",
-            (d["take"], d["lot_id"], d["take"]))
-        if cur.rowcount != 1:
-            c.close(); raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
+    try:
+        # 资格与分装母批同一套（split_reply.eligibility_sql）：子批同权进 FEFO 候选
+        lots = [dict(r) for r in c.execute(split_reply.eligibility_sql(), (body.item_id,))]
+        result = consume_fefo(lots, body.qty)
+        if not result["ok"] and result["reason"] == "qty_non_positive":
+            raise HTTPException(400, result["reason"])
+        if not result["ok"]:
+            raise HTTPException(409, result)
+        for d in result["deductions"]:
+            # 守卫式扣减：拆批/过期可能在计划与落库之间改变行；余量不够则整单回滚，
+            # 扣减只落在计划命中的真实行（回包打谁 = 行自己的 id）。
             cur = c.execute(
-                "UPDATE lots SET status='consumed', qty_remain=0 "
-                "WHERE id=? AND status='on_shelf' AND qty_remain <= 0", (d["lot_id"],))
+                "UPDATE lots SET qty_remain = qty_remain - ? "
+                "WHERE id=? AND status='on_shelf' AND data_quality='clean' AND qty_remain >= ?",
+                (d["take"], d["lot_id"], d["take"]))
             if cur.rowcount != 1:
-                c.close(); raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+                raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
+            rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
+            if rem <= 0:
+                cur = c.execute(
+                    "UPDATE lots SET status='consumed', qty_remain=0 "
+                    "WHERE id=? AND status='on_shelf' AND qty_remain <= 0", (d["lot_id"],))
+                if cur.rowcount != 1:
+                    raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
+        c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
+                  (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
+        c.commit()
+    except Exception:
+        # 任一步失败整单回滚：不留下扣了一半的母行/子行
+        c.rollback(); raise
+    finally:
+        c.close()
+    return result
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
     c = connect()
-    lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
-    ids = split_reply.sweep_ids(lots, date.today().isoformat(), expire_lots)
-    changed = []
-    for i in ids:
-        # 守卫：只下架仍在架且有余量的行；已消费/已拆没的母批不会被回包成 expired
-        cur = c.execute(
-            "UPDATE lots SET status='expired' WHERE id=? AND status='on_shelf' AND qty_remain>0", (i,))
-        if cur.rowcount == 1:
-            changed.append(i)
-    c.commit(); c.close(); return {"expired_ids": changed}
+    try:
+        lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
+        ids = split_reply.sweep_ids(lots, date.today().isoformat(), expire_lots)
+        changed = []
+        for i in ids:
+            # 收走列谁 = 真实到期的行自己；已消费/余量为 0 的行不会被误收
+            cur = c.execute(
+                "UPDATE lots SET status='expired' WHERE id=? AND status='on_shelf' AND qty_remain>0", (i,))
+            if cur.rowcount == 1:
+                changed.append(i)
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally:
+        c.close()
+    return {"expired_ids": changed}
 
 class SplitIn(BaseModel):
     lot_id: int
@@ -179,11 +189,13 @@ def split_confirm(body: SplitIn):
                 raise HTTPException(400, payload["reason"])
             raise HTTPException(409, payload)
         q = payload["qty"]
-        # 守卫式扣减母批：资格与消费一致，且余量必须仍 >= 拆量
+        # 守卫式扣减母批：资格与消费同一套，且余量必须仍等于预览值——
+        # 拆袋确认与扣减/收走叠在同一母行时只有一个能成交，其余 409 重新预览，
+        # 绝不出现子行已上架而母行未减、或母行已减而子行没有的半状态。
         cur = c.execute(
             "UPDATE lots SET qty_remain = qty_remain - ? "
-            "WHERE id=? AND status='on_shelf' AND data_quality='clean' AND qty_remain >= ?",
-            (q, body.lot_id, q))
+            "WHERE id=? AND status='on_shelf' AND data_quality='clean' AND qty_remain = ?",
+            (q, body.lot_id, before))
         if cur.rowcount != 1:
             raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": body.lot_id})
         parent_after = c.execute(
@@ -203,10 +215,10 @@ def split_confirm(body: SplitIn):
     except Exception:
         c.rollback(); c.close(); raise
     c.close()
-    fake = split_reply.consume_target_id(body.lot_id, child_id)
+    # 回包与履历同记真实被扣的母批；子批是独立新行，不再被二次归因
     return {
         "ok": True, "parent_id": body.lot_id, "child_id": child_id,
-        "consume_lot_id": fake,
+        "consume_lot_id": split_reply.consume_target_id(body.lot_id, child_id),
         "history_lot_id": split_reply.history_target_id(body.lot_id, child_id),
         "before": before, "parent_after": parent_after, "child_qty": q,
         "expiry": lot["expiry"], "sum_after": float(check),
