@@ -8,6 +8,10 @@ remain rows can therefore neither be consumed nor split.
 # 临期消费候选 / 分装母批共用的同一套资格
 ELIGIBLE_QUALITY = "clean"
 
+# 与 is_eligible 同一条规则的 SQL 形态：on_shelf + qty_remain>0 + clean。
+# 扣减候选与分装母批都只用这一份；拆出的子批（split_from）是真实在架行，不在排除之列。
+ELIGIBILITY_WHERE = "status='on_shelf' AND qty_remain>0 AND data_quality='clean'"
+
 def is_eligible(lot: dict) -> bool:
     return (
         lot.get("status") == "on_shelf"

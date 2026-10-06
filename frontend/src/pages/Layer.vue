@@ -1,6 +1,6 @@
 <template>
   <div>
-    <h1>{{ props.layer }} 层 · 拆后仍点母行</h1>
+    <h1>{{ props.layer }} 层 · 母子批同资格</h1>
     <p class="muted">本层合计 {{ total }}（与全层页该层小计同源同和）</p>
     <span v-for="x in rows" :key="x.id" class="lot">
       {{ x.name }} ×{{ x.qty_remain }} · {{ x.expiry }}

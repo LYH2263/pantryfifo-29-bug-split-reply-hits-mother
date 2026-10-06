@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.fefo import consume_fefo, expire_lots, split_plan
+from app.engines.fefo import ELIGIBILITY_WHERE, consume_fefo, expire_lots, split_plan
 from app.engines import split_reply
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
@@ -76,35 +76,42 @@ class ConsumeIn(BaseModel):
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
     c = connect()
-    # 资格与分装母批一致：on_shelf + qty_remain>0 + clean
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0 "
-        "AND data_quality='clean' AND split_from IS NULL",
-        (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        # 守卫式扣减：拆批/过期可能在计划与落库之间改变行；余量不够则整单回滚，
-        # 绝不把扣减落到已不足量（例如拆后余量变小）的旧母批上。
-        cur = c.execute(
-            "UPDATE lots SET qty_remain = qty_remain - ? "
-            "WHERE id=? AND status='on_shelf' AND data_quality='clean' AND qty_remain >= ?",
-            (d["take"], d["lot_id"], d["take"]))
-        if cur.rowcount != 1:
-            c.close(); raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
+    try:
+        # 资格与分装母批一致：on_shelf + qty_remain>0 + clean。
+        # 拆出的子批是真实在架行，先到期同样会被打到。
+        lots = [dict(r) for r in c.execute(
+            f"SELECT * FROM lots WHERE item_id=? AND {ELIGIBILITY_WHERE}",
+            (body.item_id,))]
+        result = consume_fefo(lots, body.qty)
+        if not result["ok"] and result["reason"] == "qty_non_positive":
+            raise HTTPException(400, result["reason"])
+        if not result["ok"]:
+            raise HTTPException(409, result)
+        for d in result["deductions"]:
+            # 守卫式扣减：拆批/过期可能在计划与落库之间改变行；余量不够则整单回滚，
+            # 绝不把扣减落到已不足量（例如拆后余量变小）的旧母批上。
             cur = c.execute(
-                "UPDATE lots SET status='consumed', qty_remain=0 "
-                "WHERE id=? AND status='on_shelf' AND qty_remain <= 0", (d["lot_id"],))
+                "UPDATE lots SET qty_remain = qty_remain - ? "
+                "WHERE id=? AND status='on_shelf' AND data_quality='clean' AND qty_remain >= ?",
+                (d["take"], d["lot_id"], d["take"]))
             if cur.rowcount != 1:
-                c.close(); raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+                raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
+            rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
+            if rem <= 0:
+                cur = c.execute(
+                    "UPDATE lots SET status='consumed', qty_remain=0 "
+                    "WHERE id=? AND status='on_shelf' AND qty_remain <= 0", (d["lot_id"],))
+                if cur.rowcount != 1:
+                    raise HTTPException(409, {"ok": False, "reason": "lot_changed", "lot_id": d["lot_id"]})
+        c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
+                  (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
+        c.commit()
+    except Exception:
+        # 任一守卫失败整单回滚：扣减不落一半，履历也不多一条
+        c.rollback(); raise
+    finally:
+        c.close()
+    return result
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
@@ -165,7 +172,8 @@ def split_confirm(body: SplitIn):
     """确认分装：母批减余量、子批上架，同一事务原子提交。
 
     - 守恒：母批拆后余量 + 子批量 == 拆前余量
-    - 子批 split_from 指向母批；母批行永不消失，后续 FEFO 命中的是真实子批 id
+    - 子批 split_from 指向母批；母子两批都是在架真实行，后续 FEFO 按到期命中行自身
+    - 分装是移动不是扣减：回包只带守恒事实，不写消费履历，履历不会按子行再扣一遍
     - 任一步失败整单回滚，绝不留下没有母批的孤儿行
     """
     c = connect()
@@ -203,15 +211,12 @@ def split_confirm(body: SplitIn):
     except Exception:
         c.rollback(); c.close(); raise
     c.close()
-    fake = split_reply.consume_target_id(body.lot_id, child_id)
+    # 回包只有守恒事实：母行余量、子行 id、拆前拆后总量。
+    # 不带 deductions/假身份字段——分装不是扣减，履历无可回放。
     return {
         "ok": True, "parent_id": body.lot_id, "child_id": child_id,
-        "consume_lot_id": fake,
-        "history_lot_id": split_reply.history_target_id(body.lot_id, child_id),
         "before": before, "parent_after": parent_after, "child_qty": q,
-        "expiry": lot["expiry"], "sum_after": float(check),
-        "deductions": split_reply.rewrite_deductions(
-            [{"lot_id": child_id, "take": q}], body.lot_id, child_id),
+        "expiry": lot["expiry"], "sum_after": float(check), "conserved": True,
     }
 
 @app.get("/api/settings")
